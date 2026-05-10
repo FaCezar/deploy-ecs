@@ -1,0 +1,70 @@
+name: Deploy to AWS ECS Fargate (OIDC)
+
+# Trigger on push to main (adjust branches as needed)
+on:
+  push:
+    branches:
+      - main
+
+permissions:
+  id-token: write    # allow OIDC token
+  contents: read
+
+env:
+  AWS_REGION: ${{ secrets.AWS_REGION }}
+  AWS_ACCOUNT_ID: ${{ secrets.AWS_ACCOUNT_ID }}
+  ECR_REPOSITORY: ${{ secrets.ECR_REPOSITORY }}
+  ECS_CLUSTER: my-fargate-cluster       # change if you store in secrets instead
+  ECS_SERVICE: my-fargate-service       # change if you store in secrets instead
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up QEMU (optional, for multi-platform builds)
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        run: |
+          aws ecr get-login-password --region ${AWS_REGION} \
+            | docker login --username AWS --password-stdin ${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com
+
+      - name: Build image
+        id: build-image
+        run: |
+          SHORT_SHA=${GITHUB_SHA::8}
+          IMAGE_URI=${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPOSITORY}:${SHORT_SHA}
+          echo "IMAGE_URI=$IMAGE_URI" >> $GITHUB_OUTPUT
+          docker build -t $IMAGE_URI .
+
+      - name: Push image to ECR
+        run: |
+          IMAGE_URI=${{ steps.build-image.outputs.IMAGE_URI }}
+          docker push $IMAGE_URI
+
+      - name: Update ECS service to use new image (force new deployment)
+        run: |
+          IMAGE_URI=${{ steps.build-image.outputs.IMAGE_URI }}
+          echo "Updating ECS service ${ECS_CLUSTER}/${ECS_SERVICE} with image $IMAGE_URI"
+          # If you use task definitions with image placeholders, consider registering a new task def revision.
+          aws ecs update-service \
+            --cluster "$ECS_CLUSTER" \
+            --service "$ECS_SERVICE" \
+            --force-new-deployment \
+            --region "${AWS_REGION}"
+
+      - name: Output deployed image
+        run: echo "Deployed image: ${{ steps.build-image.outputs.IMAGE_URI }}"
